@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Golden Xmas Tree - iPad Edition</title>
+    <style>
+        :root { --gold: #e2c05d; --red: #ff4d4d; }
+        body { margin: 0; background: #010501; overflow: hidden; font-family: -apple-system, sans-serif; }
+        
+        /* 适配 iPad 的 UI 布局 */
+        #ui-layer { 
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%; 
+            pointer-events: none; z-index: 10; padding: env(safe-area-inset-top) 30px;
+            box-sizing: border-box;
+        }
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 20px;
+            display: inline-block;
+            margin-top: 20px;
+        }
+        h1 { color: var(--gold); font-weight: 200; letter-spacing: 4px; margin: 0 0 10px 0; font-size: 24px; }
+        .gesture-badge { color: white; font-size: 14px; opacity: 0.8; margin-bottom: 5px; }
+
+        /* 视频预览窗靠边显示 */
+        #video-preview { 
+            position: absolute; top: 20px; right: 20px; width: 200px; height: 150px; 
+            border-radius: 15px; transform: scaleX(-1); border: 1px solid var(--gold);
+            z-index: 5; background: #000; object-fit: cover;
+        }
+
+        #upload-group {
+            position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%);
+            pointer-events: auto; z-index: 20;
+        }
+        .btn-main {
+            background: linear-gradient(135deg, var(--gold), #b38b2d);
+            color: #000; padding: 15px 35px; border-radius: 40px;
+            font-weight: bold; border: none; font-size: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        #loading { 
+            position: fixed; inset: 0; background: #010501; z-index: 100;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .tree-loader { width: 0; height: 0; border-left: 20px solid transparent; border-right: 20px solid transparent; border-bottom: 40px solid var(--gold); animation: pulse 1s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { transform: scale(1); opacity: 0.5; } 50% { transform: scale(1.2); opacity: 1; } }
+    </style>
+</head>
+<body>
+
+<div id="loading">
+    <div class="tree-loader"></div>
+    <p style="color: var(--gold); margin-top: 20px; letter-spacing: 2px;">正在连接 AI 视觉系统...</p>
+</div>
+
+<video id="video-preview" autoplay playsinline></video>
+
+<div id="ui-layer">
+    <div class="glass-panel">
+        <h1>XMAS VISION</h1>
+        <div class="gesture-badge">✊ 握拳：聚合</div>
+        <div class="gesture-badge">🖐️ 张手：散开</div>
+        <div class="gesture-badge">🤏 捏合：放大</div>
+    </div>
+</div>
+
+<div id="upload-group">
+    <button class="btn-main" onclick="document.getElementById('file-in').click()">🎁 上传照片云</button>
+    <input type="file" id="file-in" hidden multiple accept="image/*">
+</div>
+
+<canvas id="stage"></canvas>
+
+<script src="https://fastly.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://fastly.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://fastly.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://fastly.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+let scene, camera, renderer, composer, clock;
+let particles, photoMeshes = [];
+let targetState = 'FOLD'; // FOLD, SCATTER, ZOOM
+let mouseX = 0, mouseY = 0;
+
+// 针对 iPad 性能优化：粒子数 800
+const PARTICLE_COUNT = 800;
+const targetPositions = { fold: [], scatter: [] };
+const currentPositions = [];
+
+function init() {
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x010501, 0.02);
+
+    // iPad 比例优化相机
+    camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 5, 22);
+
+    renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('stage'), antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    
+    // 电影级辉光
+    const renderPass = new RenderPass(scene, camera);
+    const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.0, 0.4, 0.8);
+    composer = new EffectComposer(renderer);
+    composer.addPass(renderPass);
+    composer.addPass(bloomPass);
+
+    clock = new THREE.Clock();
+    
+    createAssets();
+    setupAI();
+    loop();
+
+    // 陀螺仪支持 (iPad 移动旋转感)
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        window.addEventListener('click', () => {
+            DeviceOrientationEvent.requestPermission();
+        }, { once: true });
+    }
+    window.addEventListener('deviceorientation', (e) => {
+        mouseX = (e.gamma || 0) * 0.1;
+        mouseY = (e.beta || 0) * 0.1;
+    });
+}
+
+function createAssets() {
+    const geo = new THREE.IcosahedronGeometry(0.15, 0);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.9, roughness: 0.1 });
+    particles = new THREE.InstancedMesh(geo, mat, PARTICLE_COUNT);
+    
+    const dummy = new THREE.Object3D();
+    const colors = [0x2d5a27, 0xd4af37, 0xc41e3a];
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const t = i / PARTICLE_COUNT;
+        // 圣诞树形 (螺旋上升)
+        const angle = t * Math.PI * 20;
+        const radius = (1 - t) * 7;
+        const foldPos = new THREE.Vector3(Math.cos(angle) * radius, t * 16 - 8, Math.sin(angle) * radius);
+        
+        // 散开星云态
+        const scatterPos = new THREE.Vector3((Math.random()-0.5)*40, (Math.random()-0.5)*40, (Math.random()-0.5)*40);
+        
+        targetPositions.fold.push(foldPos);
+        targetPositions.scatter.push(scatterPos);
+        currentPositions.push(scatterPos.clone());
+        
+        particles.setColorAt(i, new THREE.Color(colors[i % 3]));
+    }
+    scene.add(particles);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+}
+
+async function setupAI() {
+    const hands = new Hands({ locateFile: (file) => `https://fastly.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7 });
+    
+    const video = document.getElementById('video-preview');
+    const cameraAI = new Camera(video, {
+        onFrame: async () => {
+            await hands.send({ image: video });
+            document.getElementById('loading').style.display = 'none';
+        }
+    });
+
+    hands.onResults(results => {
+        if (!results.multiHandLandmarks?.length) return;
+        const lm = results.multiHandLandmarks[0];
+        
+        // 手势判断逻辑
+        const dist = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+        const handSize = dist(lm[0], lm[9]);
+        const fingerGap = dist(lm[8], lm[0]);
+
+        if (dist(lm[8], lm[4]) < 0.04) targetState = 'ZOOM';
+        else if (fingerGap < handSize * 1.2) targetState = 'FOLD';
+        else targetState = 'SCATTER';
+
+        // 视角跟随
+        camera.position.x += ((lm[9].x - 0.5) * -10 - camera.position.x) * 0.1;
+        camera.position.y += ((0.5 - lm[9].y) * 10 + 5 - camera.position.y) * 0.1;
+    });
+
+    cameraAI.start();
+}
+
+function loop() {
+    requestAnimationFrame(loop);
+    const time = clock.getElapsedTime();
+    const dummy = new THREE.Object3D();
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const target = targetState === 'FOLD' ? targetPositions.fold[i] : targetPositions.scatter[i];
+        currentPositions[i].lerp(target, 0.08);
+        
+        dummy.position.copy(currentPositions[i]);
+        // 浮动动效
+        dummy.position.y += Math.sin(time + i) * 0.02;
+        dummy.rotation.set(time * 0.2, i, 0);
+        dummy.updateMatrix();
+        particles.setMatrixAt(i, dummy.matrix);
+    }
+    particles.instanceMatrix.needsUpdate = true;
+
+    // 旋转逻辑
+    if (targetState === 'FOLD') scene.rotation.y += 0.01;
+    else scene.rotation.y += (mouseX - scene.rotation.y) * 0.05;
+
+    // 照片云
+    photoMeshes.forEach((mesh, i) => {
+        if (targetState === 'ZOOM' && i === photoMeshes.length - 1) {
+            mesh.position.lerp(new THREE.Vector3(0, 2, 10), 0.1);
+            mesh.lookAt(camera.position);
+        } else {
+            const angle = (i / photoMeshes.length) * Math.PI * 2 + time * 0.1;
+            mesh.position.lerp(new THREE.Vector3(Math.cos(angle)*10, Math.sin(i)*5, Math.sin(angle)*10), 0.05);
+            mesh.lookAt(0, 0, 0);
+        }
+    });
+
+    composer.render();
+}
+
+// 照片上传逻辑
+document.getElementById('file-in').onchange = (e) => {
+    const loader = new THREE.TextureLoader();
+    for (let file of e.target.files) {
+        loader.load(URL.createObjectURL(file), tex => {
+            const mesh = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), new THREE.MeshBasicMaterial({ map: tex, side: 2 }));
+            mesh.position.set(0, 20, 0);
+            scene.add(mesh);
+            photoMeshes.push(mesh);
+        });
+    }
+};
+
+window.onresize = () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+};
+
+init();
+</script>
+</body>
+</html>
